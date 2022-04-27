@@ -153,11 +153,15 @@ struct App {
     ComPtr<ID3D12PipelineState>    _pipelineState;
 
     ComPtr<ID3D12Resource>          _indexBufferResource;
-    D3D12_INDEX_BUFFER_VIEW         _indexBufferView;
     uint32_t                        _indicesCount;
     ComPtr<ID3D12Resource>          _vertexBufferResource;
-    D3D12_VERTEX_BUFFER_VIEW        _vertexBufferView;
     uint32_t                        _verticesCount;
+
+    // Meshlets data
+    ComPtr<ID3D12Resource>          _meshletsBufferResource;
+    ComPtr<ID3D12Resource>          _uniqueVertexIBBufferResource;
+    ComPtr<ID3D12Resource>          _primitiveIndiceBufferResource;
+    uint32_t                        _meshletsCount;
 
     // Runtime
     UINT _currentSwapChainBufferIndex;
@@ -431,6 +435,9 @@ struct App {
             // Pull root signature frm the precompiled mesh shader
             ThrowIfFailed(_device->CreateRootSignature(0, meshShader.code->GetBufferPointer(), meshShader.code->GetBufferSize(), IID_PPV_ARGS(&_rootSignature)));
 
+            D3D12_RASTERIZER_DESC rasteriserDesc = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+            rasteriserDesc.FrontCounterClockwise = TRUE;
+
             D3DX12_MESH_SHADER_PIPELINE_STATE_DESC psoDesc = {};
             psoDesc.pRootSignature          = _rootSignature.Get();
             psoDesc.MS                      = { meshShader.code->GetBufferPointer(), meshShader.code->GetBufferSize() };
@@ -438,7 +445,7 @@ struct App {
             psoDesc.NumRenderTargets        = 1;
             psoDesc.RTVFormats[0]           = _renderTargets[0]->GetDesc().Format;
             psoDesc.DSVFormat               = _depthStencil->GetDesc().Format;
-            psoDesc.RasterizerState         = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT); // CW front; cull back
+            psoDesc.RasterizerState         = rasteriserDesc;
             psoDesc.BlendState              = CD3DX12_BLEND_DESC(D3D12_DEFAULT); // Opaque
             psoDesc.DepthStencilState       = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT); // Less-equal depth test w/ writes; no stencil
             psoDesc.SampleMask              = UINT_MAX;
@@ -464,41 +471,108 @@ struct App {
 
         // Get some asset to render
         {
+            const uint8_t swapBuffer = _frameId % SwapChainBufferCount;
+            _commandList[swapBuffer]->Reset(_commandAllocator[swapBuffer].Get(), nullptr);
+
             WaveFrontReader<uint32_t> wfReader;
             ThrowIfFailed(wfReader.Load(ASSETS_PATH L"dragon.obj", true));
 
             _indicesCount = wfReader.indices.size();
             _verticesCount = wfReader.vertices.size();
 
-            auto indexDesc = CD3DX12_RESOURCE_DESC::Buffer(wfReader.indices.size() * sizeof(wfReader.indices[0]));
+            // Generate meshlet data
+            ComPtr<ID3D12Resource> meshletUpload;
+            ComPtr<ID3D12Resource> uniqueVertexIBUpload;
+            ComPtr<ID3D12Resource> primitiveIndicesUpload;
+            {
+                std::vector<DirectX::XMFLOAT3> positions;
+                positions.reserve(wfReader.vertices.size());
+
+                for (const auto& vert : wfReader.vertices) {
+                    positions.push_back(vert.position);
+                };
+
+                std::vector<DirectX::Meshlet> meshlets;
+                std::vector<uint8_t> uniqueVertexIB;
+                std::vector<DirectX::MeshletTriangle> primitiveIndices;
+
+                ThrowIfFailed(DirectX::ComputeMeshlets(
+                    wfReader.indices.data(), wfReader.indices.size()/3,
+                    positions.data(), positions.size(),
+                    nullptr,
+                    meshlets,
+                    uniqueVertexIB,
+                    primitiveIndices
+                ));
+
+                _meshletsCount = meshlets.size();
+
+                // Target buffers
+                auto meshletsDesc = CD3DX12_RESOURCE_DESC::Buffer(meshlets.size() * sizeof(meshlets[0]));
+                auto uniqueVertexIBDesc = CD3DX12_RESOURCE_DESC::Buffer(uniqueVertexIB.size() * sizeof(uniqueVertexIB[0]));
+                auto primitiveIndicesDesc = CD3DX12_RESOURCE_DESC::Buffer(primitiveIndices.size() * sizeof(primitiveIndices[0]));
+                
+                auto defaultHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+                ThrowIfFailed(_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &meshletsDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(_meshletsBufferResource.GetAddressOf())));
+                ThrowIfFailed(_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &uniqueVertexIBDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(_uniqueVertexIBBufferResource.GetAddressOf())));
+                ThrowIfFailed(_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &primitiveIndicesDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(_primitiveIndiceBufferResource.GetAddressOf())));
+                // Upload
+                {
+
+                    auto uploadHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+                    ThrowIfFailed(_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &meshletsDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(meshletUpload.GetAddressOf())));
+                    meshletUpload->SetName(L"Meshlet Upload Buffer");
+                    ThrowIfFailed(_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &uniqueVertexIBDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(uniqueVertexIBUpload.GetAddressOf())));
+                    uniqueVertexIBUpload->SetName(L"Unique Vertex IB Upload Buffer");
+                    ThrowIfFailed(_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &primitiveIndicesDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(primitiveIndicesUpload.GetAddressOf())));
+                    primitiveIndicesUpload->SetName(L"Primitive Indices Upload Buffer");
+
+                    // Copy meshlet data
+                    {
+                        byte* memory = nullptr;
+                        meshletUpload->Map(0, nullptr, reinterpret_cast<void**>(&memory));
+                        std::memcpy(memory, meshlets.data(), meshlets.size() * sizeof(meshlets[0]));
+                        meshletUpload->Unmap(0, nullptr);
+
+                        _commandList[swapBuffer]->CopyResource(_meshletsBufferResource.Get(), meshletUpload.Get());
+                        const auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(_meshletsBufferResource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                        _commandList[swapBuffer]->ResourceBarrier(1, &barrier);
+                    }
+
+                    // Copy unique vertex ib data
+                    {
+                        byte* memory = nullptr;
+                        uniqueVertexIBUpload->Map(0, nullptr, reinterpret_cast<void**>(&memory));
+                        std::memcpy(memory, uniqueVertexIB.data(), uniqueVertexIB.size() * sizeof(uniqueVertexIB[0]));
+                        uniqueVertexIBUpload->Unmap(0, nullptr);
+
+                        _commandList[swapBuffer]->CopyResource(_uniqueVertexIBBufferResource.Get(), uniqueVertexIBUpload.Get());
+                        const auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(_uniqueVertexIBBufferResource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                        _commandList[swapBuffer]->ResourceBarrier(1, &barrier);
+                    }
+
+                    // Copy primitive indices data
+                    {
+                        byte* memory = nullptr;
+                        primitiveIndicesUpload->Map(0, nullptr, reinterpret_cast<void**>(&memory));
+                        std::memcpy(memory, primitiveIndices.data(), primitiveIndices.size() * sizeof(primitiveIndices[0]));
+                        primitiveIndicesUpload->Unmap(0, nullptr);
+
+                        _commandList[swapBuffer]->CopyResource(_primitiveIndiceBufferResource.Get(), primitiveIndicesUpload.Get());
+                        const auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(_primitiveIndiceBufferResource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                        _commandList[swapBuffer]->ResourceBarrier(1, &barrier);
+                    }
+                }
+
+            }
+
             auto vertexDesc = CD3DX12_RESOURCE_DESC::Buffer(wfReader.vertices.size() * sizeof(wfReader.vertices[0]));
-            
             auto defaultHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
-            ThrowIfFailed(_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &indexDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(_indexBufferResource.GetAddressOf())));
             ThrowIfFailed(_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &vertexDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(_vertexBufferResource.GetAddressOf())));
 
-            _indexBufferView.BufferLocation = _indexBufferResource->GetGPUVirtualAddress();
-            _indexBufferView.Format = DXGI_FORMAT_R32_UINT;
-            _indexBufferView.SizeInBytes = wfReader.indices.size() * sizeof(wfReader.indices[0]);
-
-            _vertexBufferView.BufferLocation = _vertexBufferResource->GetGPUVirtualAddress();
-            _vertexBufferView.SizeInBytes = wfReader.vertices.size() * sizeof(wfReader.vertices[0]);
-            _vertexBufferView.StrideInBytes = sizeof(wfReader.vertices[0]);
-
-            ComPtr<ID3D12Resource> indexUpload;
             ComPtr<ID3D12Resource> vertexUpload;
-
             auto uploadHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
-            ThrowIfFailed(_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &indexDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(indexUpload.GetAddressOf())));
             ThrowIfFailed(_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &vertexDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(vertexUpload.GetAddressOf())));
-
-            // Move index buffer to upload
-            {
-                byte* memory = nullptr;
-                indexUpload->Map(0, nullptr, reinterpret_cast<void**>(&memory));
-                std::memcpy(memory, wfReader.indices.data(), sizeof(wfReader.indices[0]) * wfReader.indices.size());
-                indexUpload->Unmap(0, nullptr);
-            }
 
             // Move vertex buffer to upload
             {
@@ -507,14 +581,6 @@ struct App {
                 std::memcpy(memory, wfReader.vertices.data(), sizeof(wfReader.vertices[0]) * wfReader.vertices.size());
                 vertexUpload->Unmap(0, nullptr);
             }
-
-            const uint8_t swapBuffer = _frameId % SwapChainBufferCount;
-
-            _commandList[swapBuffer]->Reset(_commandAllocator[swapBuffer].Get(), nullptr);
-
-            _commandList[swapBuffer]->CopyResource(_indexBufferResource.Get(), indexUpload.Get());
-            const auto indexCopyBarrier = CD3DX12_RESOURCE_BARRIER::Transition(_indexBufferResource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            _commandList[swapBuffer]->ResourceBarrier(1, &indexCopyBarrier);
 
             _commandList[swapBuffer]->CopyResource(_vertexBufferResource.Get(), vertexUpload.Get());
             const auto vertexCopyBarrier = CD3DX12_RESOURCE_BARRIER::Transition(_vertexBufferResource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -555,8 +621,14 @@ struct App {
         data.VerticesCount = _verticesCount;
         const uint8_t swapBuffer = _frameId % SwapChainBufferCount;
 
-        XMMATRIX world = XMMATRIX(g_XMIdentityR0, g_XMIdentityR1, g_XMIdentityR2, g_XMIdentityR3);
-        XMMATRIX view = XMMatrixTranslation(0, -4, -10);
+
+        SYSTEMTIME lt;    
+        GetLocalTime(&lt);
+        float time = (lt.wMinute * 60 + lt.wSecond) * 1000 + lt.wMilliseconds;
+
+        //XMMATRIX world = XMMATRIX(g_XMIdentityR0, g_XMIdentityR1, g_XMIdentityR2, g_XMIdentityR3);
+        XMMATRIX world = XMMatrixRotationY(time/1000.f);
+        XMMATRIX view = XMMatrixTranslation(0, -4, -13);
         XMMATRIX proj = XMMatrixPerspectiveFovRH(XM_PI / 3.0f, static_cast<float>(_winWidth)/static_cast<float>(_winHeight), 0.1f, 100.f);
 
         XMStoreFloat4x4(&data.World, XMMatrixTranspose(world));
@@ -586,9 +658,11 @@ struct App {
         _commandList[swapBuffer]->SetGraphicsRootConstantBufferView(0, _constantBuffer->GetGPUVirtualAddress() + sizeof(SceneConstantBuffer) * _currentSwapChainBufferIndex);
 
         _commandList[swapBuffer]->SetGraphicsRootShaderResourceView(1, _vertexBufferResource.Get()->GetGPUVirtualAddress());
-        _commandList[swapBuffer]->SetGraphicsRootShaderResourceView(2, _indexBufferResource.Get()->GetGPUVirtualAddress());
+        _commandList[swapBuffer]->SetGraphicsRootShaderResourceView(2, _meshletsBufferResource.Get()->GetGPUVirtualAddress());
+        _commandList[swapBuffer]->SetGraphicsRootShaderResourceView(3, _uniqueVertexIBBufferResource.Get()->GetGPUVirtualAddress());
+        _commandList[swapBuffer]->SetGraphicsRootShaderResourceView(4, _primitiveIndiceBufferResource.Get()->GetGPUVirtualAddress());
 
-        _commandList[swapBuffer]->DispatchMesh((_indicesCount/3 + 31)/32, 1, 1);
+        _commandList[swapBuffer]->DispatchMesh(_meshletsCount, 1, 1);
 
         const auto toPresentBarrier = CD3DX12_RESOURCE_BARRIER::Transition(_renderTargets[swapBuffer].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
         _commandList[swapBuffer]->ResourceBarrier(1, &toPresentBarrier);

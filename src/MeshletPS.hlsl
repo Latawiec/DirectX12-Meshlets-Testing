@@ -22,7 +22,7 @@ float4 main(VertexOut input) : SV_TARGET
 {
     float ambientIntensity = 0.1;
     float3 lightColor = float3(1, 1, 1);
-    float3 lightDir = -normalize(float3(1, -1, 1));
+    float3 lightDir = -normalize(float3(3, -1, -3));
 
     float3 diffuseColor;
     float shininess;
